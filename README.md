@@ -1,6 +1,12 @@
 ![# KVCache-Facroty](assets/logo.png)
 
+## Enviroment Notes
 
+**When installing flash-attn, download the wheel**
+
+ https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/flash_attn-2.7.3+cu11torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl, 
+ 
+ **and install it with pip locally.**
 
 ## News
 
