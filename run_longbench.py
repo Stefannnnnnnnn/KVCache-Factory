@@ -9,9 +9,12 @@ from tqdm import tqdm
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
-            "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
-            "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+datasets = [
+    # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
+    #         "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
+    #         "passage_count", "passage_retrieval_en", "lcc", "repobench-p"
+    "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "musique",
+    "triviaqa", "samsum", "passage_retrieval_en"]
 
 dataset2maxlen = {
     "narrativeqa": 128,
@@ -379,9 +382,10 @@ if __name__ == "__main__":
     )
 
 
-    from pyramidkv.monkeypatch import replace_llama,replace_mistral
+    from pyramidkv.monkeypatch import replace_llama
+    # ,replace_mistral
     replace_llama(args.method.lower())
-    replace_mistral(args.method.lower())
+    # replace_mistral(args.method.lower())
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
