@@ -9,12 +9,21 @@ from tqdm import tqdm
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# Added for LLAMA-GPTQ
+from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
+from auto_gptq import exllama_set_max_input_length
+
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 datasets = [
     # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
     #         "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
     #         "passage_count", "passage_retrieval_en", "lcc", "repobench-p"
-    "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "musique",
-    "triviaqa", "samsum", "passage_retrieval_en"]
+    "narrativeqa", "triviaqa",
+    # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "musique",
+    # "triviaqa",  "passage_retrieval_en"
+]
 
 dataset2maxlen = {
     "narrativeqa": 128,
@@ -277,6 +286,16 @@ def main(args):
                 eos_token_id=[tokenizer.eos_token_id]
             )
         else:
+            print("Using quantization on kv cache")
+            # quant_cache_config={
+            #     "nbits": args.nbits,
+            #     "backend": "HQQ",
+            #     "device": "cuda",
+            #     "residual_length": output_max_len,
+            #     "axis_key": 1,
+            #     "q_group_size": 64
+            # }
+            
             output = model.generate(
                 **tokenized_prompts,
                 output_attentions = args.output_attentions,
@@ -287,7 +306,7 @@ def main(args):
                 min_length=context_length+1,
                 eos_token_id=[tokenizer.eos_token_id],
                 cache_implementation="quantized", 
-                cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
+                cache_config={"nbits": args.nbits, "backend": "quanto"},
             )
 
         batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
@@ -375,10 +394,12 @@ if __name__ == "__main__":
         from pyramidkv.quantcache import KVQuantizedCache
         from transformers import cache_utils
         cache_utils.HQQQuantizedCache = KVQuantizedCache
+        
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_path,
         use_fast=args.use_fast_tokenizer,
-        padding_side="left"
+        padding_side="left",
+        cache_dir="/workspace"
     )
 
 
@@ -393,8 +414,26 @@ if __name__ == "__main__":
         low_cpu_mem_usage=True,
         device_map="auto",
         use_cache=args.use_cache,
-        attn_implementation=args.attn_implementation
+        attn_implementation=args.attn_implementation,
+        cache_dir="/workspace"
     )
+
+    # model_id = "hugging-quants/Meta-Llama-3.1-70B-Instruct-GPTQ-INT4"
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #   model_id,
+    #   use_fast=args.use_fast_tokenizer,
+    #   cache_dir="/workspace",
+    #   padding_side="left")
+    # model = AutoModelForCausalLM.from_pretrained(
+    #   model_id,
+    #   torch_dtype=torch.float16,
+    #   low_cpu_mem_usage=True,
+    #   device_map="auto",
+    #   use_cache=args.use_cache,
+    #   attn_implementation=args.attn_implementation,
+    #   cache_dir="/workspace"
+    # )
+    # model = exllama_set_max_input_length(model, 7950)
         
 
     tokenizer.padding_side = "left"
