@@ -10,8 +10,9 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Added for LLAMA-GPTQ
-from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
-from auto_gptq import exllama_set_max_input_length
+# from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
+# from auto_gptq import exllama_set_max_input_length
+from awq import AutoAWQForCausalLM
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -306,7 +307,7 @@ def main(args):
                 min_length=context_length+1,
                 eos_token_id=[tokenizer.eos_token_id],
                 cache_implementation="quantized", 
-                cache_config={"nbits": args.nbits, "backend": "quanto"},
+                cache_config={"nbits": args.nbits, "backend": "HQQ"},
             )
 
         batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
@@ -402,7 +403,6 @@ if __name__ == "__main__":
         cache_dir="/workspace"
     )
 
-
     from pyramidkv.monkeypatch import replace_llama
     # ,replace_mistral
     replace_llama(args.method.lower())
@@ -416,25 +416,7 @@ if __name__ == "__main__":
         use_cache=args.use_cache,
         attn_implementation=args.attn_implementation,
         cache_dir="/workspace"
-    )
-
-    # model_id = "hugging-quants/Meta-Llama-3.1-70B-Instruct-GPTQ-INT4"
-    # tokenizer = AutoTokenizer.from_pretrained(
-    #   model_id,
-    #   use_fast=args.use_fast_tokenizer,
-    #   cache_dir="/workspace",
-    #   padding_side="left")
-    # model = AutoModelForCausalLM.from_pretrained(
-    #   model_id,
-    #   torch_dtype=torch.float16,
-    #   low_cpu_mem_usage=True,
-    #   device_map="auto",
-    #   use_cache=args.use_cache,
-    #   attn_implementation=args.attn_implementation,
-    #   cache_dir="/workspace"
-    # )
-    # model = exllama_set_max_input_length(model, 7950)
-        
+    )    
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
