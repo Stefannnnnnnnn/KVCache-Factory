@@ -10,6 +10,8 @@
 
  If this wheel still does not work, try to **build flash-attn from the source**
 
+- Currently, we use init.sh to initialize the environment.
+
 ## News
 
 - [2024-11-28] Çhange the name to KVCache-Factory! The target of our project is now a unified framework of KV Cache compression of diverse models.
