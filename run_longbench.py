@@ -2,6 +2,7 @@ import os
 import json
 import random
 import argparse
+import time
 
 import numpy as np
 from tqdm import tqdm
@@ -12,6 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Added for LLAMA-GPTQ
 # from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
 # from auto_gptq import exllama_set_max_input_length
+
 from awq import AutoAWQForCausalLM
 
 import os
@@ -21,9 +23,7 @@ datasets = [
     # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
     #         "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
     #         "passage_count", "passage_retrieval_en", "lcc", "repobench-p"
-    "narrativeqa", "triviaqa",
-    # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "musique",
-    # "triviaqa",  "passage_retrieval_en"
+    "narrativeqa", "triviaqa"
 ]
 
 dataset2maxlen = {
@@ -191,6 +191,15 @@ def main(args):
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
 
     fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}.json"), "w")
+
+    # 添加性能测量变量
+    total_tokens_generated = 0
+    total_generation_time = 0
+    peak_memory_usage = 0
+    # 开始前清空缓存
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    initial_memory = torch.cuda.memory_allocated()
      
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
         
@@ -275,6 +284,10 @@ def main(args):
             
 
         context_length = batch_input_ids.shape[-1]
+
+        # 添加时间测量
+        start_time = time.time()
+        
         if args.quant_method == None:        
             output = model.generate(
                 **tokenized_prompts,
@@ -288,14 +301,14 @@ def main(args):
             )
         else:
             print("Using quantization on kv cache")
-            # quant_cache_config={
-            #     "nbits": args.nbits,
-            #     "backend": "HQQ",
-            #     "device": "cuda",
-            #     "residual_length": output_max_len,
-            #     "axis_key": 1,
-            #     "q_group_size": 64
-            # }
+            quant_cache_config={
+                "nbits": args.nbits,
+                "backend": "HQQ",
+                "device": "cuda",
+                "residual_length": output_max_len,
+                "axis_key": 1,
+                "q_group_size": 64
+            }
             
             output = model.generate(
                 **tokenized_prompts,
@@ -307,7 +320,7 @@ def main(args):
                 min_length=context_length+1,
                 eos_token_id=[tokenizer.eos_token_id],
                 cache_implementation="quantized", 
-                cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
+                cache_config=quant_cache_config,
             )
 
         batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
@@ -315,6 +328,18 @@ def main(args):
         # print(f"debbug batch_outputs {batch_outputs}")
         
         batch_generations = batch_outputs
+
+        # 记录结束时间
+        end_time = time.time()
+        # 计算生成的token数量
+        new_tokens = output.shape[1] - context_length
+        # 累计统计
+        batch_time = end_time - start_time
+        total_generation_time += batch_time
+        total_tokens_generated += new_tokens
+        # 记录峰值内存
+        current_peak = torch.cuda.max_memory_allocated()
+        peak_memory_usage = max(peak_memory_usage, current_peak)
 
         torch.cuda.empty_cache()
 
@@ -336,8 +361,43 @@ def main(args):
 
             # print(f'{batch_generations[j]}')
             fout.write(json.dumps(example) + "\n")
+
+    # 计算整体性能指标
+    average_tokens_per_second = total_tokens_generated / total_generation_time
+    memory_used_mb = (peak_memory_usage - initial_memory) / (1024 * 1024)
     
+    # 保存性能报告
+    performance_report = {
+        "method": args.method,
+        "model": args.model_path,
+        "dataset": args.dataset,
+        "max_capacity_prompts": args.max_capacity_prompts,
+        "average_tokens_per_second": average_tokens_per_second,
+        "peak_memory_usage_mb": peak_memory_usage / (1024 * 1024),
+        "memory_used_mb": memory_used_mb,
+        "total_generation_time_seconds": total_generation_time,
+        "total_tokens_generated": total_tokens_generated
+    }
+
+    perf_file_path = os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}_performance.json")
+    with open(perf_file_path, "w") as f:
+        json.dump(performance_report, f, indent=2)
     
+def compare_performance(results_dir):
+    # 收集所有性能报告
+    performance_data = []
+    for dataset_dir in os.listdir(results_dir):
+        dataset_path = os.path.join(results_dir, dataset_dir)
+        if os.path.isdir(dataset_path):
+            for file in os.listdir(dataset_path):
+                if file.endswith("_performance.json"):
+                    with open(os.path.join(dataset_path, file), "r") as f:
+                        perf_data = json.load(f)
+                        performance_data.append(perf_data)
+    # 创建比较表格
+    import pandas as pd
+    df = pd.DataFrame(performance_data)
+    df.to_csv(os.path.join(results_dir, "performance_comparison.csv"), index=False)
 
 if __name__ == "__main__":
 
@@ -441,3 +501,5 @@ if __name__ == "__main__":
         args.data_file = f"data/LongBench/{args.dataset}.jsonl"
         
         main(args)
+
+    compare_performance(args.save_dir)

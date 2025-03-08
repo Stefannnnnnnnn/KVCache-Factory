@@ -9,7 +9,7 @@ model_path=hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4
 merge_method=$7 # Support "pivot"(LOOK-M_PivotMerge).
 quant_method=kivi # Support kivi and kvquant, default None.
 nbits=4 # Quantization bit-width support 8,4,2. Need to set quant_method first.
-save_dir=${source_path}"results_long_bench" # path to result save_dir
+save_dir=${source_path}"/results_long_bench" # path to result save_dir
 
 cache_dir="/workspace"
 
