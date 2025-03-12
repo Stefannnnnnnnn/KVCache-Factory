@@ -119,7 +119,7 @@ if __name__ == '__main__':
                 args.method = method
                 args.dataset = dataset
                 args.eval_file = os.path.join(args.results_dir,dataset,f"{method}.json")
-                
+                print(args.eval_file)
                 # try:
                 
                 scores = dict()

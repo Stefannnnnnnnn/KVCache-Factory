@@ -19,7 +19,7 @@ python3 run_longbench.py \
     --max_capacity_prompts ${max_capacity_prompts} \
     --attn_implementation ${attn_implementation} \
     --save_dir ${save_dir} \
-    --max_num_examples 1000 \
-    --nbits ${nbits} \
-    --quant_method ${quant_method} \
+    --max_num_examples 100
+    # --nbits ${nbits} \
+    # --quant_method ${quant_method}
         # --merge ${merge_method} \

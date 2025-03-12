@@ -1,5 +1,5 @@
 
-results_dir=$1
+results_dir=/root/outputs/results_long_bench/meta-llama-3.1-70b-instruct-awq-int4_128
 
 
 python3 eval.py \
