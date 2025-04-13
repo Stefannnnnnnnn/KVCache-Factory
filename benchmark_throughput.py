@@ -41,11 +41,22 @@ def memory_monitor(peak_memory_mb: Value, stop_flag: Value, interval=0.1):
                 peak_memory_mb.value = current
         time.sleep(interval)
 
-def generate_synthetic_prompt(target_length, tokenizer):
+def generate_synthetic_prompt(target_length, tokenizer, variation_seed=None):
     """Generate a synthetic prompt with approximately the target number of tokens."""
     # Base text that can be repeated to achieve desired length
     base_text = "This is a benchmark test for language models. We are testing memory usage and generation speed with various input lengths. "
     
+    # Add some variation if seed is provided
+    if variation_seed is not None:
+        random.seed(variation_seed)
+        variations = [
+            "The performance of large language models depends on many factors including hardware, implementation, and optimization techniques. ",
+            "Benchmarking is essential to understand the trade-offs between speed, memory usage, and generation quality. ",
+            "KV cache optimization is one way to improve inference efficiency while maintaining output quality. ",
+            "Context length handling is becoming increasingly important as models are deployed in real-world applications. "
+        ]
+        base_text += random.choice(variations)
+        
     # Estimate tokens per base_text
     tokens_per_base_text = len(tokenizer.encode(base_text))
     
@@ -91,11 +102,15 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 def main(args):
-    # Start monitor process
-    peak_memory_mb = Value('i', 0)
-    stop_flag = Value('b', False)
-    monitor = Process(target=memory_monitor, args=(peak_memory_mb, stop_flag))
-    monitor.start()
+    # Dictionary to store benchmark results
+    benchmark_results = {
+        "model": args.model_path,
+        "method": args.method,
+        "batch_size": args.batch_size,
+        "runs_per_length": args.runs_per_length,
+        "output_tokens": args.output_tokens,
+        "results": {}
+    }
     
     # Set up the model and tokenizer
     print(f"Loading model from {args.model_path}...")
@@ -117,11 +132,11 @@ def main(args):
     
     # Create output directory
     model_name = args.model_path.split("/")[-1]
-    output_dir = os.path.join(args.save_dir, f"{model_name}_{args.method}")
+    output_dir = os.path.join(args.save_dir, f"{model_name}_{args.method}_batch{args.batch_size}")
     os.makedirs(output_dir, exist_ok=True)
     
     # Define token length scenarios to test
-    token_lengths = [6000]
+    token_lengths = [2000, 6000, 10000]
     if args.custom_lengths:
         token_lengths = [int(x) for x in args.custom_lengths.split(',')]
     
@@ -132,15 +147,6 @@ def main(args):
     if len(valid_token_lengths) < len(token_lengths):
         skipped = set(token_lengths) - set(valid_token_lengths)
         print(f"Skipping token lengths {skipped} as they exceed model's max context length of {model_max_length}")
-    
-    # Dictionary to store benchmark results
-    benchmark_results = {
-        "model": args.model_path,
-        "method": args.method,
-        "runs_per_length": args.runs_per_length,
-        "output_tokens": args.output_tokens,
-        "results": {}
-    }
     
     # Load model once before testing all lengths
     print("Loading model...")
@@ -163,14 +169,12 @@ def main(args):
         "q_group_size": 64
     }
 
-    cache_config={"backend": "quanto", "nbits": args.nbits}
-    
     model.eval()
     
     # Test each token length
     for token_length in valid_token_lengths:
         print(f"\n{'='*40}")
-        print(f"Testing with input length: {token_length} tokens")
+        print(f"Testing with input length: {token_length} tokens, batch size: {args.batch_size}")
         print(f"{'='*40}")
         
         # Reset length_results for this token length
@@ -189,29 +193,48 @@ def main(args):
         
         # Run multiple tests for this token length for more reliable results
         for run in range(args.runs_per_length):
-            print(f"\nRun {run+1}/{args.runs_per_length} for {token_length} tokens")
-            
-            # Generate synthetic prompt for this length
-            prompt, actual_length = generate_synthetic_prompt(token_length, tokenizer)
-            formatted_prompt = format_for_model(prompt, args.model_path)
-            
-            # Store the generated prompt for reference
-            length_results["prompts"].append(prompt[:200] + "..." if len(prompt) > 200 else prompt)
-            length_results["actual_input_lengths"].append(actual_length)
-            
-            # Clear cache between runs instead of reloading model
+            print(f"\nRun {run+1}/{args.runs_per_length} for {token_length} tokens, batch size: {args.batch_size}")
+
+            # Start monitor process
+            peak_memory_mb = Value('i', 0)
+            stop_flag = Value('b', False)
+            monitor = Process(target=memory_monitor, args=(peak_memory_mb, stop_flag))
+            monitor.start()
+
+            # Clear cache between runs
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            
+            # Generate multiple synthetic prompts for batching
+            batch_prompts = []
+            batch_lengths = []
+            batch_formatted_prompts = []
+            
+            for batch_idx in range(args.batch_size):
+                # Use different variation seed for each batch item to ensure they're not identical
+                prompt, actual_length = generate_synthetic_prompt(token_length, tokenizer, variation_seed=run*args.batch_size+batch_idx)
+                formatted_prompt = format_for_model(prompt, args.model_path)
+                
+                batch_prompts.append(prompt)
+                batch_lengths.append(actual_length)
+                batch_formatted_prompts.append(formatted_prompt)
+            
+            # Store the generated prompts for reference (just first one for simplicity)
+            length_results["prompts"].append(batch_prompts[0][:200] + "..." if len(batch_prompts[0]) > 200 else batch_prompts[0])
+            length_results["actual_input_lengths"].append(batch_lengths[0])  # Just store the first one for reference
+            
             # Make sure KV cache is cleared
             if hasattr(model, 'past_key_values') and model.past_key_values is not None:
                 model.past_key_values = None
                 
             print("Preparing for next run...")
             
+            ###########################################################################
+            # The following part is for KV Cache Sparcification, currently using FullKV
+            ###########################################################################
             if args.max_capacity_prompts != -1:
                 max_capacity_prompts = args.max_capacity_prompts
-            
             if args.method != "FullKV":
                 if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "adakv", "headkv", "think"]:
                     window_sizes = 8
@@ -228,12 +251,10 @@ def main(args):
                     min_num = (args.max_capacity_prompts - args.max_capacity_prompts // args.head_beta)
                     head_capacity = torch.round(total_attention * total_pool_capacity + min_num).int()
                     model.model.config.head_capacity = head_capacity    
-
                 kernel_sizes = 7
                 pooling = "maxpool"
                 ratio = args.pruning_ratio
                 recent_size = args.recent_size
-
                 layers = len(model.model.layers)
                 # check if window_sizes is a list
                 if not isinstance(window_sizes, list):
@@ -256,20 +277,29 @@ def main(args):
                     model.model.layers[i].self_attn.config.ratio = ratio[i]
                     model.model.layers[i].self_attn.config.recent_size = recent_size[i]
             
-            # Prepare for generation
-            tokenized_prompt = tokenizer(formatted_prompt, return_tensors="pt").to('cuda')
-            input_ids = tokenized_prompt.input_ids
-                        
+            # Prepare batch for generation
+            # Tokenize all prompts in the batch
+            tokenized_prompts = tokenizer(
+                batch_formatted_prompts, 
+                return_tensors="pt", 
+                padding=True,
+                truncation=True,
+                max_length=args.model_max_length
+            ).to('cuda')
+            
+            input_ids = tokenized_prompts.input_ids
+            attention_mask = tokenized_prompts.attention_mask
+            
+            # Get Initial(Model) Memory
             torch.cuda.synchronize()
-
             initial_nvidia_memory = get_gpu_memory()
             
             # --- Warmup Phase ---
             for _ in range(args.warmup_iters):
                 with torch.no_grad():
-                    _ = model(input_ids=input_ids, attention_mask=tokenized_prompt.attention_mask, use_cache=True)
+                    _ = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
             
-            print(f"Generating with {actual_length} input tokens...")
+            print(f"Generating with batch size {args.batch_size}, each with ~{token_length} input tokens...")
             
             # First, measure prefill time (time for first token generation)
             prefill_start_event = torch.cuda.Event(enable_timing=True)
@@ -283,29 +313,30 @@ def main(args):
             past_key_values = None
             next_token = None
             prefill_start_event.record()
-
             # Prepare initial forward pass
             with torch.no_grad():
                 if args.kv_quant is not None:
                     output = model.generate(
-                        **tokenized_prompt,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
                         max_new_tokens=1,
                         num_beams=1,
                         do_sample=False,
                         temperature=1.0,
-                        min_length=tokenized_prompt['input_ids'].shape[-1]+1,
+                        min_length=input_ids.shape[-1]+1,
                         eos_token_id=[tokenizer.eos_token_id],
                         cache_implementation="quantized", 
                         cache_config=quant_cache_config,
                     )
                 else:
                     output = model.generate(
-                        **tokenized_prompt,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
                         max_new_tokens=1,
                         num_beams=1,
                         do_sample=False,
                         temperature=1.0,
-                        min_length=tokenized_prompt['input_ids'].shape[-1]+1,
+                        min_length=input_ids.shape[-1]+1,
                         eos_token_id=[tokenizer.eos_token_id]
                     )
             torch.cuda.synchronize()
@@ -321,24 +352,26 @@ def main(args):
             with torch.no_grad():
                 if args.kv_quant is not None:
                     output = model.generate(
-                        **tokenized_prompt,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
                         max_new_tokens=args.output_tokens,
                         num_beams=1,
                         do_sample=False,
                         temperature=1.0,
-                        min_length=tokenized_prompt['input_ids'].shape[-1]+1,
+                        min_length=input_ids.shape[-1]+1,
                         eos_token_id=[tokenizer.eos_token_id],
                         cache_implementation="quantized", 
                         cache_config=quant_cache_config,
                     )
                 else:
                     output = model.generate(
-                        **tokenized_prompt,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
                         max_new_tokens=args.output_tokens,
                         num_beams=1,
                         do_sample=False,
                         temperature=1.0,
-                        min_length=tokenized_prompt['input_ids'].shape[-1]+1,
+                        min_length=input_ids.shape[-1]+1,
                         eos_token_id=[tokenizer.eos_token_id]
                     )
             torch.cuda.synchronize()
@@ -347,12 +380,21 @@ def main(args):
             stop_flag.value = True
             monitor.join()
             
-            # Calculate metrics for generation phase
+            # Calculate generation time
             generation_time = generation_start_event.elapsed_time(generation_end_event) / 1000.0  # convert ms to seconds
-            output_length = output[0].shape[0] - tokenized_prompt['input_ids'].shape[1]
             
-            # Calculate tokens per second (only counting generated tokens)
-            tokens_per_sec = output_length / (generation_time - prefill_time)
+            # Calculate output lengths - might be different for each item in batch
+            output_lengths = []
+            for i, output_seq in enumerate(output):
+                output_length = output_seq.shape[0] - input_ids.shape[1]
+                output_lengths.append(output_length)
+            
+            # Average output length
+            avg_output_length = sum(output_lengths) / len(output_lengths)
+            
+            # Calculate average tokens per second (total tokens / time)
+            total_generated_tokens = sum(output_lengths)
+            tokens_per_sec = total_generated_tokens / (generation_time - prefill_time)
             
             # Store results
             length_results["model_memory_mb"].append(float(initial_nvidia_memory))
@@ -360,9 +402,9 @@ def main(args):
             length_results["prefill_time_sec"].append(float(prefill_time))
             length_results["decode_time_sec"].append(float(generation_time - prefill_time))
             length_results["tokens_per_sec"].append(float(tokens_per_sec))
-            length_results["output_lengths"].append(int(output_length))
+            length_results["output_lengths"].append(int(avg_output_length))
             
-            print(f"Completed generation: {output_length} tokens in {generation_time:.2f} seconds")
+            print(f"Completed batch generation: {total_generated_tokens} total tokens ({avg_output_length:.1f} avg per batch item) in {generation_time:.2f} seconds")
             print(f"Metrics:")
             print(f"  - Total Memory: {(peak_memory_mb.value):.2f} MB")
             print(f"  - Model Memory: {initial_nvidia_memory:.2f} MB")
@@ -376,23 +418,23 @@ def main(args):
             torch.cuda.ipc_collect()
             outputs = None
         
-        # # Calculate averages for this token length
-        # length_results["avg_total_memory_mb"] = float(np.mean(length_results["total_memory_mb"]))
-        # length_results["avg_prefill_time_sec"] = float(np.mean(length_results["prefill_time_sec"]))
-        # length_results["avg_tokens_per_sec"] = float(np.mean(length_results["tokens_per_sec"]))
+        # Calculate averages for this token length
+        length_results["avg_total_memory_mb"] = float(np.mean(length_results["total_memory_mb"]))
+        length_results["avg_prefill_time_sec"] = float(np.mean(length_results["prefill_time_sec"]))
+        length_results["avg_tokens_per_sec"] = float(np.mean(length_results["tokens_per_sec"]))
         
-        # # Store results for this token length
-        # benchmark_results["results"][str(token_length)] = length_results
+        # Store results for this token length
+        benchmark_results["results"][str(token_length)] = length_results
         
-        # print(f"\nAverage results for {token_length} tokens:")
-        # print(f"  - Avg Total Memory: {length_results['avg_total_memory_mb']:.2f} MB")
-        # print(f"  - Avg Prefill Time: {length_results['avg_prefill_time_sec']:.4f} sec")
-        # print(f"  - Avg Tokens/sec: {length_results['avg_tokens_per_sec']:.2f}")
+        print(f"\nAverage results for {token_length} tokens with batch size {args.batch_size}:")
+        print(f"  - Avg Total Memory: {length_results['avg_total_memory_mb']:.2f} MB")
+        print(f"  - Avg Prefill Time: {length_results['avg_prefill_time_sec']:.4f} sec")
+        print(f"  - Avg Tokens/sec: {length_results['avg_tokens_per_sec']:.2f}")
         
-        # # Save interim results after each token length
-        # results_file = os.path.join(output_dir, f"benchmark_results.json")
-        # with open(results_file, "w") as f:
-        #     json.dump(benchmark_results, f, indent=2)
+        # Save interim results after each token length
+        results_file = os.path.join(output_dir, f"benchmark_results.json")
+        with open(results_file, "w") as f:
+            json.dump(benchmark_results, f, indent=2)
             
     print(f"\nBenchmark complete! Results saved to {output_dir}")
 
@@ -413,6 +455,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_tokens", type=int, default=512, help="Number of tokens to generate in each test")
     parser.add_argument("--save_dir", type=str, default="benchmark_results", help="Directory to save benchmark results")
     parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup Loops")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference")
     
     # Optimized KV cache parameters
     parser.add_argument("--max_capacity_prompts", type=int, default=512, help="Maximum capacity for prompt tokens in optimized KV cache")
@@ -420,7 +463,6 @@ if __name__ == "__main__":
     parser.add_argument("--floor", type=float, default=0.2, help="Floor parameter for AdaKV")
     parser.add_argument("--recent_size", type=int, default=32, help="Recent size parameter for optimized KV methods")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="Pruning ratio for Key Cache")
-    
     
     # Misc
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
