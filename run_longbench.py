@@ -2,9 +2,6 @@ import os
 import json
 import random
 import argparse
-import time
-from collections import defaultdict
-import subprocess
 
 import numpy as np
 from tqdm import tqdm
@@ -15,18 +12,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Added for LLAMA-GPTQ
 # from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
 # from auto_gptq import exllama_set_max_input_length
-
 from awq import AutoAWQForCausalLM
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 datasets = [
-    # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
-    #         "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
-    #         "passage_count", "passage_retrieval_en", "lcc", "repobench-p"
-    # "narrativeqa"
-    "triviaqa", "gov_report"
+    "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
+            "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
+            "passage_count", "passage_retrieval_en", "lcc", "repobench-p"
+    # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "musique",
+    # "triviaqa",  "passage_retrieval_en"
 ]
 
 dataset2maxlen = {
@@ -118,31 +114,6 @@ def build_chat(prompt):
 #     prompt = f"<<SYS>>\n {SYSTEM_PROMPT} \n<</SYS>>\n\n{prompt}"
 #     return prompt
 
-
-def get_gpu_memory():
-    try:
-        result = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
-            encoding='utf-8'
-        ).strip()
-        
-        # 处理输出为空的情况
-        if not result:
-            return 0
-        
-        # 解析每张 GPU 的内存占用
-        return sum(int(x) for x in result.split('\n'))
-    
-    except FileNotFoundError:
-        print("Error: nvidia-smi command not found. Is NVIDIA driver installed?")
-        return 0
-    except subprocess.CalledProcessError:
-        print("Error: Failed to execute nvidia-smi command.")
-        return 0
-    except ValueError:
-        print("Error: Unexpected output format from nvidia-smi.")
-        return 0
-
 def main(args):
     
 
@@ -216,28 +187,9 @@ def main(args):
     
     model_name = model_path.split("/")[-1]
 
-    # Create output directory
-    output_dir = os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset)
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
 
     fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}.json"), "w")
-
-    perf_metrics = {
-        'total_tokens_generated': 0,
-        'total_prefill_time': 0,
-        'total_decode_time': 0,
-        'peak_memory_pytorch': 0,
-        'peak_memory_nvidia': 0,
-        'per_length_metrics': defaultdict(lambda: {'tokens': 0, 'prefill_time': 0, 'decode_time': 0, 'count': 0}),
-        'latencies': []
-    }
-
-    torch.cuda.synchronize()
-    # Start with clean CUDA memory
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    initial_memory_pytorch = torch.cuda.memory_allocated()
-    initial_memory_nvidia = get_gpu_memory()
      
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
         
@@ -255,15 +207,6 @@ def main(args):
         tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=True).to('cuda')
         batch_input_ids = tokenized_prompts.input_ids
         attention_mask = tokenized_prompts.attention_mask
-
-        # Record sequence length for metrics
-        seq_length = batch_input_ids.shape[1]
-        
-        # Clear CUDA cache before generation
-        torch.cuda.empty_cache()
-        memory_before = torch.cuda.memory_allocated()
-        nvidia_memory_before = get_gpu_memory()
-        
         if len(batch_input_ids[0]) > model_max_len:
             half = int(model_max_len/2)
             prompt = tokenizer.decode(batch_input_ids[0][:half], skip_special_tokens=True)+tokenizer.decode(batch_input_ids[0][-half:], skip_special_tokens=True)
@@ -330,14 +273,6 @@ def main(args):
             
 
         context_length = batch_input_ids.shape[-1]
-
-        # Setup CUDA timing events for accurate measurement
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        # Record start time
-        start_event.record()
-        
         if args.quant_method == None:        
             output = model.generate(
                 **tokenized_prompts,
@@ -370,76 +305,12 @@ def main(args):
                 min_length=context_length+1,
                 eos_token_id=[tokenizer.eos_token_id],
                 cache_implementation="quantized", 
-                cache_config=quant_cache_config,
+                cache_config=quant_cache_config
             )
-
-        # batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
-
-        # Record end time and synchronize
-        end_event.record()
-        torch.cuda.synchronize()
-        
-        # Get total generation time in seconds
-        total_generation_time = start_event.elapsed_time(end_event) / 1000.0  # Convert ms to seconds
-        
-        # Get output sequence
-        if hasattr(output, "sequences"):
-            generated_sequence = output.sequences[0]
-            new_tokens = output.sequences.shape[1] - context_length
-            batch_outputs = tokenizer.batch_decode([output.sequences[0][context_length:]], skip_special_tokens=True)
-        else:
-            generated_sequence = output[0]
-            new_tokens = generated_sequence.shape[0] - context_length
-            batch_outputs = tokenizer.batch_decode([generated_sequence[context_length:]], skip_special_tokens=True)
+        batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
+        # print(f"debbug batch_outputs {batch_outputs}")
         
         batch_generations = batch_outputs
-        
-        # Get prefill and decode timing, with fallback if not provided
-        prefill_time = getattr(output, "prefill_time", None)
-        decode_time = getattr(output, "decode_time", None)
-        
-        # Fallback if timing not provided by model
-        if prefill_time is None or decode_time is None:
-            # Estimate split: typically prefill is 1/3 of time for long contexts
-            prefill_ratio = 0.35  # Estimated ratio for prefill vs total time
-            prefill_time = total_generation_time * prefill_ratio
-            decode_time = total_generation_time * (1 - prefill_ratio)
-        
-        # Small epsilon to prevent division by zero
-        epsilon = 1e-6
-        
-        # 记录内存状态（操作执行后）
-        memory_after = torch.cuda.memory_allocated()
-        nvidia_memory_after = get_gpu_memory()
-        
-        # 计算 GPU 内存变化
-        memory_used = max(memory_after - memory_before, 0)
-        nvidia_memory_used = max(nvidia_memory_after - nvidia_memory_before, 0)
-        
-        # Update performance metrics
-        perf_metrics['total_tokens_generated'] += new_tokens
-        perf_metrics['total_prefill_time'] += prefill_time
-        perf_metrics['total_decode_time'] += decode_time
-        perf_metrics['peak_memory_pytorch'] = max(perf_metrics['peak_memory_pytorch'], torch.cuda.max_memory_allocated())
-        perf_metrics['peak_memory_nvidia'] = max(perf_metrics['peak_memory_nvidia'], nvidia_memory_after)
-        
-        # Per-length metrics
-        length_bucket = seq_length // 500 * 500  # Group by 500 tokens
-        perf_metrics['per_length_metrics'][length_bucket]['tokens'] += new_tokens
-        perf_metrics['per_length_metrics'][length_bucket]['prefill_time'] += prefill_time
-        perf_metrics['per_length_metrics'][length_bucket]['decode_time'] += decode_time
-        perf_metrics['per_length_metrics'][length_bucket]['count'] += 1
-        
-        # Record latency for this batch
-        perf_metrics['latencies'].append({
-            'seq_length': seq_length,
-            'output_length': new_tokens,
-            'prefill_time': prefill_time,
-            'decode_time': decode_time,
-            'total_time': total_generation_time,
-            'prefill_tokens_per_sec': seq_length / (prefill_time + epsilon),
-            'decode_tokens_per_sec': new_tokens / (decode_time + epsilon)
-        })
 
         for j in range(args.eval_batch_size):
             
@@ -459,140 +330,6 @@ def main(args):
 
             # print(f'{batch_generations[j]}')
             fout.write(json.dumps(example) + "\n")
-            
-        # Clear cache between batches
-        torch.cuda.empty_cache()
-
-    # Calculate final metrics with sanity checks
-    epsilon = 1e-6  # Small value to avoid division by zero
-    
-    # Calculate overall metrics
-    overall_tokens_per_sec = perf_metrics['total_tokens_generated'] / max(
-        perf_metrics['total_prefill_time'] + perf_metrics['total_decode_time'], epsilon)
-    
-    prefill_tokens_per_sec = sum(l['seq_length'] for l in perf_metrics['latencies']) / max(
-        perf_metrics['total_prefill_time'], epsilon)
-    
-    decode_tokens_per_sec = perf_metrics['total_tokens_generated'] / max(
-        perf_metrics['total_decode_time'], epsilon)
-    
-    # Apply reasonable caps to prevent absurd values
-    MAX_REASONABLE_PREFILL_TPS = 10000  # 10k tokens per second for prefill
-    MAX_REASONABLE_DECODE_TPS = 300     # 300 tokens per second for decode
-    
-    prefill_tokens_per_sec = min(prefill_tokens_per_sec, MAX_REASONABLE_PREFILL_TPS)
-    decode_tokens_per_sec = min(decode_tokens_per_sec, MAX_REASONABLE_DECODE_TPS)
-    overall_tokens_per_sec = min(overall_tokens_per_sec, MAX_REASONABLE_DECODE_TPS)
-    
-    # Process per-length metrics
-    per_length_report = {}
-    for length, data in sorted(perf_metrics['per_length_metrics'].items()):
-        if data['count'] > 0:
-            avg_prefill = data['prefill_time'] / data['count']
-            avg_decode = data['decode_time'] / data['count']
-            avg_tokens = data['tokens'] / data['count']
-            
-            per_length_report[str(length)] = {
-                'avg_prefill_time': avg_prefill,
-                'avg_decode_time': avg_decode,
-                'avg_tokens_generated': avg_tokens,
-                'prefill_tokens_per_sec': min(length / max(avg_prefill, epsilon), MAX_REASONABLE_PREFILL_TPS),
-                'decode_tokens_per_sec': min(avg_tokens / max(avg_decode, epsilon), MAX_REASONABLE_DECODE_TPS),
-                'sample_count': data['count']
-            }
-    
-    # Calculate latency statistics
-    if perf_metrics['latencies']:
-        latency_stats = {
-            'prefill': {
-                'min': min(l['prefill_time'] for l in perf_metrics['latencies']),
-                'max': max(l['prefill_time'] for l in perf_metrics['latencies']),
-                'avg': sum(l['prefill_time'] for l in perf_metrics['latencies']) / len(perf_metrics['latencies'])
-            },
-            'decode': {
-                'min': min(l['decode_time'] for l in perf_metrics['latencies']),
-                'max': max(l['decode_time'] for l in perf_metrics['latencies']),
-                'avg': sum(l['decode_time'] for l in perf_metrics['latencies']) / len(perf_metrics['latencies'])
-            }
-        }
-    else:
-        latency_stats = {'prefill': {}, 'decode': {}}
-    
-    # Calculate memory usage
-    memory_used_mb_pytorch = (perf_metrics['peak_memory_pytorch'] - initial_memory_pytorch) / (1024 * 1024)
-    memory_used_mb_nvidia = perf_metrics['peak_memory_nvidia'] - initial_memory_nvidia
-    
-    # Create detailed performance report
-    detailed_performance_report = {
-        "method": args.method,
-        "model": args.model_path,
-        "dataset": args.dataset,
-        "max_capacity_prompts": args.max_capacity_prompts,
-        "throughput": {
-            "overall_tokens_per_second": float(overall_tokens_per_sec),
-            "prefill_tokens_per_second": float(prefill_tokens_per_sec),
-            "decode_tokens_per_second": float(decode_tokens_per_sec),
-        },
-        "memory": {
-            "peak_memory_pytorch_mb": float(perf_metrics['peak_memory_pytorch'] / (1024 * 1024)),
-            "peak_memory_nvidia_mb": float(perf_metrics['peak_memory_nvidia']),
-            "memory_used_pytorch_mb": float(memory_used_mb_pytorch),
-            "memory_used_nvidia_mb": float(memory_used_mb_nvidia),
-        },
-        "timing": {
-            "total_prefill_time_seconds": float(perf_metrics['total_prefill_time']),
-            "total_decode_time_seconds": float(perf_metrics['total_decode_time']),
-            "total_generation_time_seconds": float(perf_metrics['total_prefill_time'] + perf_metrics['total_decode_time']),
-        },
-        "tokens_info": {
-            "total_tokens_generated": int(perf_metrics['total_tokens_generated']),
-        },
-        "per_length_performance": per_length_report,
-        "latency_statistics": latency_stats
-    }
-
-    # Create simplified performance report for compatibility
-    performance_report = {
-        "method": args.method,
-        "model": args.model_path,
-        "dataset": args.dataset,
-        "max_capacity_prompts": args.max_capacity_prompts,
-        "average_tokens_per_second": float(overall_tokens_per_sec),
-        "prefill_tokens_per_second": float(prefill_tokens_per_sec),
-        "decode_tokens_per_second": float(decode_tokens_per_sec),
-        "peak_memory_usage_mb": float(perf_metrics['peak_memory_pytorch'] / (1024 * 1024)),
-        "peak_memory_nvidia_mb": float(perf_metrics['peak_memory_nvidia']),
-        "memory_used_mb": float(memory_used_mb_pytorch),
-        "total_generation_time_seconds": float(perf_metrics['total_prefill_time'] + perf_metrics['total_decode_time']),
-        "total_tokens_generated": int(perf_metrics['total_tokens_generated'])
-    }
-
-    # Save performance reports
-    detailed_perf_file_path = os.path.join(output_dir, f"{args.method}_detailed_performance.json")
-    with open(detailed_perf_file_path, "w") as f:
-        json.dump(detailed_performance_report, f, indent=2)
-    
-    perf_file_path = os.path.join(output_dir, f"{args.method}_performance.json")
-    with open(perf_file_path, "w") as f:
-        json.dump(performance_report, f, indent=2)
-    
-    fout.close()
-    
-# def compare_performance(results_dir):
-#     # 收集所有性能报告
-#     performance_data = []
-#     for dataset_dir in os.listdir(results_dir):
-#         dataset_path = os.path.join(results_dir, dataset_dir)
-#         if os.path.isdir(dataset_path):
-#             for file in os.listdir(dataset_path):
-#                 if file.endswith("_performance.json"):
-#                     with open(os.path.join(dataset_path, file), "r") as f:
-#                         perf_data = json.load(f)
-#                         performance_data.append(perf_data)
-#     # 创建比较表格
-#     import pandas as pd
-#     df = pd.DataFrame(performance_data)
-#     df.to_csv(os.path.join(results_dir, "performance_comparison.csv"), index=False)
 
 if __name__ == "__main__":
 
@@ -696,5 +433,3 @@ if __name__ == "__main__":
         args.data_file = f"data/LongBench/{args.dataset}.jsonl"
         
         main(args)
-
-    # compare_performance(args.save_dir)

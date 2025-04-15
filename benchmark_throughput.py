@@ -13,6 +13,10 @@ import gc
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from awq import AutoAWQForCausalLM
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # Memory tracking utilities
 def get_gpu_memory():
     """Get the GPU memory usage using nvidia-smi command."""
@@ -223,6 +227,19 @@ def main(args):
             # Store the generated prompts for reference (just first one for simplicity)
             length_results["prompts"].append(batch_prompts[0][:200] + "..." if len(batch_prompts[0]) > 200 else batch_prompts[0])
             length_results["actual_input_lengths"].append(batch_lengths[0])  # Just store the first one for reference
+
+            # Prepare batch for generation
+            # Tokenize all prompts in the batch
+            tokenized_prompts = tokenizer(
+                batch_formatted_prompts, 
+                return_tensors="pt", 
+                padding=True,
+                truncation=True,
+                max_length=args.model_max_length
+            ).to('cuda')
+            
+            input_ids = tokenized_prompts.input_ids
+            attention_mask = tokenized_prompts.attention_mask
             
             # Make sure KV cache is cleared
             if hasattr(model, 'past_key_values') and model.past_key_values is not None:
@@ -240,7 +257,7 @@ def main(args):
                     window_sizes = 8
                 elif args.method.lower() in ["streamingllm"]:
                     window_sizes = max_capacity_prompts - 4
-
+    
                 if args.method.lower() =='headkv':
                     with open(args.head_path, 'r') as file:
                         head_list = json.loads(file.readline())
@@ -251,10 +268,12 @@ def main(args):
                     min_num = (args.max_capacity_prompts - args.max_capacity_prompts // args.head_beta)
                     head_capacity = torch.round(total_attention * total_pool_capacity + min_num).int()
                     model.model.config.head_capacity = head_capacity    
+    
                 kernel_sizes = 7
                 pooling = "maxpool"
                 ratio = args.pruning_ratio
                 recent_size = args.recent_size
+    
                 layers = len(model.model.layers)
                 # check if window_sizes is a list
                 if not isinstance(window_sizes, list):
@@ -276,19 +295,8 @@ def main(args):
                     model.model.layers[i].self_attn.config.floor = args.floor
                     model.model.layers[i].self_attn.config.ratio = ratio[i]
                     model.model.layers[i].self_attn.config.recent_size = recent_size[i]
-            
-            # Prepare batch for generation
-            # Tokenize all prompts in the batch
-            tokenized_prompts = tokenizer(
-                batch_formatted_prompts, 
-                return_tensors="pt", 
-                padding=True,
-                truncation=True,
-                max_length=args.model_max_length
-            ).to('cuda')
-            
-            input_ids = tokenized_prompts.input_ids
-            attention_mask = tokenized_prompts.attention_mask
+                    
+            context_length = input_ids.shape[-1]
             
             # Get Initial(Model) Memory
             torch.cuda.synchronize()
@@ -319,6 +327,7 @@ def main(args):
                     output = model.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        output_attentions = False,
                         max_new_tokens=1,
                         num_beams=1,
                         do_sample=False,
@@ -332,6 +341,7 @@ def main(args):
                     output = model.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        output_attentions = False,
                         max_new_tokens=1,
                         num_beams=1,
                         do_sample=False,
@@ -354,6 +364,7 @@ def main(args):
                     output = model.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        output_attentions = False,
                         max_new_tokens=args.output_tokens,
                         num_beams=1,
                         do_sample=False,
@@ -367,6 +378,7 @@ def main(args):
                     output = model.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        output_attentions = False,
                         max_new_tokens=args.output_tokens,
                         num_beams=1,
                         do_sample=False,
