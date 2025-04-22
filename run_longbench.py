@@ -18,11 +18,12 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 datasets = [
-    "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
-            "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
-            "passage_count", "passage_retrieval_en", "lcc", "repobench-p"
-    # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "musique",
-    # "triviaqa",  "passage_retrieval_en"
+    # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
+    #         "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
+    #         "passage_count", "passage_retrieval_en", "lcc", "repobench-p"
+    "trec", "triviaqa", "hotpotqa", "qasper",
+    "multi_news", "samsum",
+     # "gov_report",
 ]
 
 dataset2maxlen = {

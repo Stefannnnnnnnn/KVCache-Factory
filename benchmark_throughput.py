@@ -81,9 +81,10 @@ def generate_synthetic_prompt(target_length, tokenizer, variation_seed=None):
         synthetic_prompt += " " + base_text
         encoded = tokenizer.encode(synthetic_prompt)
     
-    while len(encoded) > target_length * 1.05:
-        synthetic_prompt = synthetic_prompt[:int(len(synthetic_prompt) * 0.95)]
-        encoded = tokenizer.encode(synthetic_prompt)
+    # Hard trim to max length (to be safe)
+    if len(encoded) > args.model_max_length - 5:
+        encoded = encoded[:args.model_max_length - 5]
+        synthetic_prompt = tokenizer.decode(encoded)
     
     return synthetic_prompt, len(encoded)
 
@@ -104,6 +105,57 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
+
+def safe_tokenize_batch(
+    prompts: list,
+    tokenizer,
+    model_max_length: int,
+    device: str = 'cuda',
+    drop_empty: bool = True,
+    verbose: bool = True,
+):
+    """
+    Tokenizes a list of prompts with padding/truncation, and filters out all-padding inputs.
+
+    Args:
+        prompts (list): List of text prompts (str)
+        tokenizer: HuggingFace tokenizer
+        model_max_length (int): Max token length for the model
+        device (str): Where to send the tensors ('cuda' or 'cpu')
+        drop_empty (bool): Whether to remove all-padding inputs
+        verbose (bool): Whether to print debug info
+
+    Returns:
+        tokenized_batch (dict): tokenized inputs suitable for model.generate
+    """
+    # Initial tokenization
+    tokenized = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=model_max_length,
+        add_special_tokens=True,
+    )
+
+    # Identify non-empty inputs
+    attention_mask = tokenized['attention_mask']
+    valid_mask = attention_mask.sum(dim=1) > 0
+
+    if drop_empty:
+        # Filter only non-empty examples
+        tokenized = {
+            k: v[valid_mask] for k, v in tokenized.items()
+        }
+
+    if verbose:
+        total = len(prompts)
+        valid = valid_mask.sum().item() if drop_empty else total
+        print(f"[safe_tokenize_batch] Total: {total}, Valid: {valid}, Dropped: {total - valid}")
+
+    # Move to device
+    tokenized = {k: v.to(device) for k, v in tokenized.items()}
+    return tokenized
 
 def main(args):
     # Dictionary to store benchmark results
@@ -140,7 +192,7 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
     
     # Define token length scenarios to test
-    token_lengths = [2000, 6000, 10000]
+    token_lengths = [8000]
     if args.custom_lengths:
         token_lengths = [int(x) for x in args.custom_lengths.split(',')]
     
@@ -160,7 +212,7 @@ def main(args):
         low_cpu_mem_usage=True,
         device_map="auto",
         use_cache=True,
-        attn_implementation=args.attn_implementation,
+        # attn_implementation=args.attn_implementation,
         cache_dir="/workspace"
     )
 
@@ -230,16 +282,13 @@ def main(args):
 
             # Prepare batch for generation
             # Tokenize all prompts in the batch
-            tokenized_prompts = tokenizer(
-                batch_formatted_prompts, 
-                return_tensors="pt", 
-                padding=True,
-                truncation=True,
-                max_length=args.model_max_length
-            ).to('cuda')
-            
-            input_ids = tokenized_prompts.input_ids
-            attention_mask = tokenized_prompts.attention_mask
+            tokenized_prompts = safe_tokenize_batch(
+                batch_formatted_prompts,
+                tokenizer=tokenizer,
+                model_max_length=args.model_max_length,
+                device='cuda',
+            )
+            input_ids = tokenized_prompts['input_ids']
             
             # Make sure KV cache is cleared
             if hasattr(model, 'past_key_values') and model.past_key_values is not None:
@@ -296,8 +345,6 @@ def main(args):
                     model.model.layers[i].self_attn.config.ratio = ratio[i]
                     model.model.layers[i].self_attn.config.recent_size = recent_size[i]
                     
-            context_length = input_ids.shape[-1]
-            
             # Get Initial(Model) Memory
             torch.cuda.synchronize()
             initial_nvidia_memory = get_gpu_memory()
@@ -305,7 +352,7 @@ def main(args):
             # --- Warmup Phase ---
             for _ in range(args.warmup_iters):
                 with torch.no_grad():
-                    _ = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+                    _ = model(**tokenized_prompts, use_cache=True)
             
             print(f"Generating with batch size {args.batch_size}, each with ~{token_length} input tokens...")
             
@@ -325,8 +372,7 @@ def main(args):
             with torch.no_grad():
                 if args.kv_quant is not None:
                     output = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
+                        **tokenized_prompts,
                         output_attentions = False,
                         max_new_tokens=1,
                         num_beams=1,
@@ -339,8 +385,7 @@ def main(args):
                     )
                 else:
                     output = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
+                        **tokenized_prompts,
                         output_attentions = False,
                         max_new_tokens=1,
                         num_beams=1,
@@ -362,8 +407,7 @@ def main(args):
             with torch.no_grad():
                 if args.kv_quant is not None:
                     output = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
+                        **tokenized_prompts,
                         output_attentions = False,
                         max_new_tokens=args.output_tokens,
                         num_beams=1,
@@ -376,8 +420,7 @@ def main(args):
                     )
                 else:
                     output = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
+                        **tokenized_prompts,
                         output_attentions = False,
                         max_new_tokens=args.output_tokens,
                         num_beams=1,
@@ -467,7 +510,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_tokens", type=int, default=512, help="Number of tokens to generate in each test")
     parser.add_argument("--save_dir", type=str, default="benchmark_results", help="Directory to save benchmark results")
     parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup Loops")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size for inference")
     
     # Optimized KV cache parameters
     parser.add_argument("--max_capacity_prompts", type=int, default=512, help="Maximum capacity for prompt tokens in optimized KV cache")
