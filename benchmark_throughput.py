@@ -192,7 +192,7 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
     
     # Define token length scenarios to test
-    token_lengths = [8000]
+    token_lengths = [2048 * 8 / args.batch_size]
     if args.custom_lengths:
         token_lengths = [int(x) for x in args.custom_lengths.split(',')]
     
@@ -212,9 +212,11 @@ def main(args):
         low_cpu_mem_usage=True,
         device_map="auto",
         use_cache=True,
-        # attn_implementation=args.attn_implementation,
+        attn_implementation=args.attn_implementation,
         cache_dir="/workspace"
     )
+
+    print(f"Actual Attention class used in layer 0: {type(model.model.layers[0].self_attn)}")
 
     quant_cache_config={
         "nbits": args.nbits,
@@ -500,7 +502,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, required=True, help="Path to the HuggingFace model")
     parser.add_argument("--model_max_length", type=int, default=32000, help="Maximum context length supported by the model")
     parser.add_argument("--method", type=str, default="FullKV", help="KV cache method (FullKV, PyramidKV, SnapKV, etc.)")
-    parser.add_argument("--attn_implementation", type=str, default="flash_attention_2", choices=["flash_attention_2", "sdpa", "eager"])
+    parser.add_argument("--attn_implementation", type=str, default="sdpa", choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--kv_quant",type=str, default=None)
     parser.add_argument("--nbits", type=int, default=8, help="")
     
