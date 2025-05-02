@@ -13,12 +13,8 @@ conda env create -f ~/KVCache-Factory/environment.yml
 conda clean --all
 
 # 3. install pytorch
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 
 # 4. pip install other requirements
 pip install -r requirements.txt 
 pip cache purge
-
-# 5. bulid flash-attn from source code
-cd /workspace/flash-attention
-MAX_JOBS=4 python setup.py install
