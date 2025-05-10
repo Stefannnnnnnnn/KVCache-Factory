@@ -309,154 +309,154 @@ class SnapKVCluster():
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
         
-        # # check if prefix phase
-        # assert key_states.shape[-2] == query_states.shape[-2]
-        # bsz, num_heads, q_len, head_dim = query_states.shape
-        
-        # print(f"SnapKV max_capacity_prompt {self.max_capacity_prompt}")
-        
-        # if q_len < self.max_capacity_prompt:
-        #     return key_states, value_states
-        # else:
-        #     attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
-        #     mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-        #     mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-        #     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-        #     mask = mask.to(attn_weights.device)
-        #     attention_mask = mask[None, None, :, :]
-
-        #     attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
-
-        #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        #     attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
-        #     if self.pooling == 'avgpool':
-        #         attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
-        #     elif self.pooling == 'maxpool':
-        #         attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
-        #     else:
-        #         raise ValueError('Pooling method not supported')
-        #     indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
-        #     indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-
-        #     if self.merge is not None:
-        #         key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
-        #         return key_states, value_states
-
-        #     k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-        #     v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-        #     k_cur = key_states[:, :, -self.window_size:, :]
-        #     v_cur = value_states[:, :, -self.window_size:, :]
-        #     key_states = torch.cat([k_past_compress, k_cur], dim = 2)
-        #     value_states = torch.cat([v_past_compress, v_cur], dim = 2)
-        #     return key_states, value_states
         # check if prefix phase
-        assert key_states.shape[-2] == query_states.shape[-2] 
+        assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
-        kv_seq_len = key_states.shape[2] 
-
+        
         print(f"SnapKV max_capacity_prompt {self.max_capacity_prompt}")
-
-        if kv_seq_len < self.max_capacity_prompt:
-             print(f"SnapKV: kv_seq_len ({kv_seq_len}) < max_capacity_prompt ({self.max_capacity_prompt}). Skipping compression.")
-             return key_states, value_states
-
-        # --- 开始压缩逻辑 ---
-        print(f"SnapKV: Starting compression for kv_seq_len={kv_seq_len}")
-
-        # 准备用于计算的 query (最近的 window_size 个)
-        queries_window = query_states[:, :, -self.window_size:, :]
-        original_dtype = query_states.dtype # 保存原始数据类型
-
-        # ---> 优化点 1 & 2: 分块计算 attn_weights_sum 并使用低精度 <---
-        # 我们需要计算最近 window_size queries 和过去 keys ([:-self.window_size]) 的注意力分数，并按 query 求和
-        # target_len = kv_seq_len - self.window_size
-        # attn_weights_sum = torch.zeros(bsz, num_heads, target_len, device=query_states.device, dtype=self.low_precision_dtype) # 初始化为低精度
-
-        # 为了避免直接计算巨大的 attn_weights 矩阵 (bsz, num_heads, window_size, target_len)
-        # 我们改为计算 QK^T / sqrt(head_dim) 的部分和，模拟注意力得分的重要性
-        # 注意：这不再是严格意义上的 Softmax 后求和，而是点积和，作为重要性度量。
-        # 这是一种近似，目的是减少内存峰值。如果效果不好，可能需要更复杂的、但内存效率更高的方式来近似原方法。
-
-        target_len = kv_seq_len - self.window_size
-        attn_scores_sum = torch.zeros(bsz, num_heads, target_len, device=query_states.device, dtype=self.low_precision_dtype) # 存储点积和
-
-        # 将 query 和 key 转换为低精度进行计算
-        queries_window_low = queries_window.to(self.low_precision_dtype)
-        key_states_past_low = key_states[:, :, :-self.window_size, :].to(self.low_precision_dtype)
-        scaling_factor = (head_dim ** -0.5) # 放在循环外
-
-        # 分块计算
-        for i in range(0, target_len, self.chunk_size):
-            chunk_end = min(i + self.chunk_size, target_len)
-            # key_chunk shape: (bsz, num_heads, chunk_size, head_dim)
-            key_chunk = key_states_past_low[:, :, i:chunk_end, :]
-            # scores_chunk shape: (bsz, num_heads, window_size, chunk_size)
-            scores_chunk = torch.matmul(queries_window_low, key_chunk.transpose(2, 3)) * scaling_factor
-
-            # 对 window_size 维度求和，得到该块的重要性分数
-            # sum_scores_chunk shape: (bsz, num_heads, chunk_size)
-            sum_scores_chunk = scores_chunk.sum(dim=-2) # 在低精度下求和
-
-            # 存入结果张量
-            attn_scores_sum[:, :, i:chunk_end] = sum_scores_chunk
-
-            # ---> 优化点 3: 尝试释放中间块内存 <---
-            del key_chunk, scores_chunk, sum_scores_chunk
-            # gc.collect() # 可以尝试加入，但可能会影响性能
-
-        # 清理低精度张量
-        del queries_window_low, key_states_past_low
-        # gc.collect()
-
-        # 确保后续操作在 float32 进行可能更稳定（特别是 topk）
-        attn_scores_sum = attn_scores_sum.to(torch.float32)
-
-        # 池化操作
-        if self.pooling == 'avgpool':
-            attn_cache = F.avg_pool1d(attn_scores_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
-        elif self.pooling == 'maxpool':
-            attn_cache = F.max_pool1d(attn_scores_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+        
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
         else:
-             raise ValueError('Pooling method not supported')
+            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
+            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+            mask = mask.to(attn_weights.device)
+            attention_mask = mask[None, None, :, :]
 
-        # 选择 Top-K 索引
-        # 需要保留 max_capacity_prompt - window_size 个过去的 token
-        num_past_to_keep = self.max_capacity_prompt - self.window_size
-        # topk 返回 (values, indices)
-        # indices shape: (bsz, num_heads, num_past_to_keep)
-        indices = attn_cache.topk(num_past_to_keep, dim=-1).indices
+            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
 
-        # 清理不再需要的张量
-        del attn_scores_sum, attn_cache
-        # gc.collect()
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
+            if self.pooling == 'avgpool':
+                attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            elif self.pooling == 'maxpool':
+                attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            else:
+                raise ValueError('Pooling method not supported')
+            indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-        # 扩展索引以便 gather 操作
-        # indices shape: (bsz, num_heads, num_past_to_keep, 1)
-        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            if self.merge is not None:
+                key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
+                return key_states, value_states
 
-        # 使用 gather 提取 K, V 状态
-        # 注意：gather 操作本身也可能消耗较多内存，因为它可能创建输入张量的副本
-        # key_states shape: (bsz, num_heads, kv_seq_len, head_dim)
-        k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices_expanded)
-        v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices_expanded)
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            return key_states, value_states
+        # # check if prefix phase
+        # assert key_states.shape[-2] == query_states.shape[-2] 
+        # bsz, num_heads, q_len, head_dim = query_states.shape
+        # kv_seq_len = key_states.shape[2] 
 
-        # 获取当前的 K, V (最近的 window_size 个)
-        k_cur = key_states[:, :, -self.window_size:, :]
-        v_cur = value_states[:, :, -self.window_size:, :]
+        # # print(f"SnapKV max_capacity_prompt {self.max_capacity_prompt}")
 
-        # 拼接压缩后的过去 K/V 和当前 K/V
-        # 最终 K/V 形状: (bsz, num_heads, max_capacity_prompt, head_dim)
-        key_states_final = torch.cat([k_past_compress, k_cur], dim = 2)
-        value_states_final = torch.cat([v_past_compress, v_cur], dim = 2)
+        # if kv_seq_len < self.max_capacity_prompt:
+        #     #  print(f"SnapKV: kv_seq_len ({kv_seq_len}) < max_capacity_prompt ({self.max_capacity_prompt}). Skipping compression.")
+        #      return key_states, value_states
 
-        # 清理中间压缩结果
-        del k_past_compress, v_past_compress, k_cur, v_cur, indices, indices_expanded
-        # gc.collect() # 最后进行一次清理
+        # # --- 开始压缩逻辑 ---
+        # # print(f"SnapKV: Starting compression for kv_seq_len={kv_seq_len}")
 
-        print(f"SnapKV: Compression finished. New kv length: {key_states_final.shape[2]}")
+        # # 准备用于计算的 query (最近的 window_size 个)
+        # queries_window = query_states[:, :, -self.window_size:, :]
+        # original_dtype = query_states.dtype # 保存原始数据类型
 
-        # 返回压缩后的 K/V 状态，确保数据类型与原始一致
-        return key_states_final.to(original_dtype), value_states_final.to(original_dtype)
+        # # ---> 优化点 1 & 2: 分块计算 attn_weights_sum 并使用低精度 <---
+        # # 我们需要计算最近 window_size queries 和过去 keys ([:-self.window_size]) 的注意力分数，并按 query 求和
+        # # target_len = kv_seq_len - self.window_size
+        # # attn_weights_sum = torch.zeros(bsz, num_heads, target_len, device=query_states.device, dtype=self.low_precision_dtype) # 初始化为低精度
+
+        # # 为了避免直接计算巨大的 attn_weights 矩阵 (bsz, num_heads, window_size, target_len)
+        # # 我们改为计算 QK^T / sqrt(head_dim) 的部分和，模拟注意力得分的重要性
+        # # 注意：这不再是严格意义上的 Softmax 后求和，而是点积和，作为重要性度量。
+        # # 这是一种近似，目的是减少内存峰值。如果效果不好，可能需要更复杂的、但内存效率更高的方式来近似原方法。
+
+        # target_len = kv_seq_len - self.window_size
+        # attn_scores_sum = torch.zeros(bsz, num_heads, target_len, device=query_states.device, dtype=self.low_precision_dtype) # 存储点积和
+
+        # # 将 query 和 key 转换为低精度进行计算
+        # queries_window_low = queries_window.to(self.low_precision_dtype)
+        # key_states_past_low = key_states[:, :, :-self.window_size, :].to(self.low_precision_dtype)
+        # scaling_factor = (head_dim ** -0.5) # 放在循环外
+
+        # # 分块计算
+        # for i in range(0, target_len, self.chunk_size):
+        #     chunk_end = min(i + self.chunk_size, target_len)
+        #     # key_chunk shape: (bsz, num_heads, chunk_size, head_dim)
+        #     key_chunk = key_states_past_low[:, :, i:chunk_end, :]
+        #     # scores_chunk shape: (bsz, num_heads, window_size, chunk_size)
+        #     scores_chunk = torch.matmul(queries_window_low, key_chunk.transpose(2, 3)) * scaling_factor
+
+        #     # 对 window_size 维度求和，得到该块的重要性分数
+        #     # sum_scores_chunk shape: (bsz, num_heads, chunk_size)
+        #     sum_scores_chunk = scores_chunk.sum(dim=-2) # 在低精度下求和
+
+        #     # 存入结果张量
+        #     attn_scores_sum[:, :, i:chunk_end] = sum_scores_chunk
+
+        #     # ---> 优化点 3: 尝试释放中间块内存 <---
+        #     del key_chunk, scores_chunk, sum_scores_chunk
+        #     # gc.collect() # 可以尝试加入，但可能会影响性能
+
+        # # 清理低精度张量
+        # del queries_window_low, key_states_past_low
+        # # gc.collect()
+
+        # # 确保后续操作在 float32 进行可能更稳定（特别是 topk）
+        # attn_scores_sum = attn_scores_sum.to(torch.float32)
+
+        # # 池化操作
+        # if self.pooling == 'avgpool':
+        #     attn_cache = F.avg_pool1d(attn_scores_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+        # elif self.pooling == 'maxpool':
+        #     attn_cache = F.max_pool1d(attn_scores_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+        # else:
+        #      raise ValueError('Pooling method not supported')
+
+        # # 选择 Top-K 索引
+        # # 需要保留 max_capacity_prompt - window_size 个过去的 token
+        # num_past_to_keep = self.max_capacity_prompt - self.window_size
+        # # topk 返回 (values, indices)
+        # # indices shape: (bsz, num_heads, num_past_to_keep)
+        # indices = attn_cache.topk(num_past_to_keep, dim=-1).indices
+
+        # # 清理不再需要的张量
+        # del attn_scores_sum, attn_cache
+        # # gc.collect()
+
+        # # 扩展索引以便 gather 操作
+        # # indices shape: (bsz, num_heads, num_past_to_keep, 1)
+        # indices_expanded = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+        # # 使用 gather 提取 K, V 状态
+        # # 注意：gather 操作本身也可能消耗较多内存，因为它可能创建输入张量的副本
+        # # key_states shape: (bsz, num_heads, kv_seq_len, head_dim)
+        # k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices_expanded)
+        # v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices_expanded)
+
+        # # 获取当前的 K, V (最近的 window_size 个)
+        # k_cur = key_states[:, :, -self.window_size:, :]
+        # v_cur = value_states[:, :, -self.window_size:, :]
+
+        # # 拼接压缩后的过去 K/V 和当前 K/V
+        # # 最终 K/V 形状: (bsz, num_heads, max_capacity_prompt, head_dim)
+        # key_states_final = torch.cat([k_past_compress, k_cur], dim = 2)
+        # value_states_final = torch.cat([v_past_compress, v_cur], dim = 2)
+
+        # # 清理中间压缩结果
+        # del k_past_compress, v_past_compress, k_cur, v_cur, indices, indices_expanded
+        # # gc.collect() # 最后进行一次清理
+
+        # print(f"SnapKV: Compression finished. New kv length: {key_states_final.shape[2]}")
+
+        # # 返回压缩后的 K/V 状态，确保数据类型与原始一致
+        # return key_states_final.to(original_dtype), value_states_final.to(original_dtype)
 
 
     def update_think(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):

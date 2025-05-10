@@ -17,168 +17,9 @@ import math
 from flash_attn import flash_attn_func, flash_attn_varlen_func
 from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 from pyramidkv.pyramidkv_utils import DynamicCacheSplitHeadFlatten
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs, _flash_attention_forward
 
 logger = logging.get_logger(__name__)
-
-def _get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """
-    Retrieves indexing data required to repad unpadded (ragged) tensors.
-
-    Arguments:
-        attention_mask (`torch.Tensor`):
-            Boolean or int tensor of shape (batch_size, sequence_length), 1 means valid and 0 means not valid.
-
-    Return:
-        indices (`torch.Tensor`):
-            The indices of non-masked tokens from the flattened input sequence.
-        cu_seqlens (`torch.Tensor`):
-            The cumulative sequence lengths, used to index into ragged (unpadded) tensors. `cu_seqlens` shape is (batch_size + 1,).
-        max_seqlen_in_batch (`int`):
-            Maximum sequence length in batch.
-    """
-    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
-    return (
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-    )
-
-def _upad_input(
-    query_layer: torch.Tensor,
-    key_layer: torch.Tensor,
-    value_layer: torch.Tensor,
-    attention_mask: torch.Tensor,
-    query_length: int,
-):
-    """
-    Unpads query, key, and values tensors, using a single dimension for all tokens even though they belong to different batches.
-
-    This function is used instead of `flash_attn.bert_padding.unpad_input` in order to avoid the recomputation of the same intermediary
-    tensors for query, key, value tensors.
-
-    Arguments:
-        query_layer (`torch.Tensor`):
-            Query state with padding. Shape: (batch_size, query_length, num_heads, head_dim).
-        key_layer (`torch.Tensor`):
-            Key state with padding. Shape: (batch_size, kv_seq_len, num_key_value_heads, head_dim).
-        value_layer (`torch.Tensor`):
-            Value state with padding. Shape: (batch_size, kv_seq_len, num_key_value_heads, head_dim).
-        attention_mask (`torch.Tensor`):
-            Boolean or int tensor of shape (batch_size, sequence_length), 1 means valid and 0 means not valid.
-        query_length (`int`):
-            Target length.
-
-    Return:
-        query_layer (`torch.Tensor`):
-            Query state without padding. Shape: (total_target_length, num_heads, head_dim).
-        key_layer (`torch.Tensor`):
-            Key state with padding. Shape: (total_source_length, num_key_value_heads, head_dim).
-        value_layer (`torch.Tensor`):
-            Value state with padding. Shape: (total_source_length, num_key_value_heads, head_dim).
-        indices_q (`torch.Tensor`):
-            The indices of non-masked tokens from the flattened input target sequence.
-        (cu_seqlens_q, cu_seqlens_k) (`Tuple[int]`):
-            The cumulative sequence lengths for the target (query) and source (key, value), used to index into ragged (unpadded) tensors. `cu_seqlens` shape is (batch_size + 1,).
-        (max_seqlen_in_batch_q, max_seqlen_in_batch_k) (`Tuple[int]`):
-            Maximum sequence length in batch (`max_seqlen_in_batch_q` for the target sequence i.e. query, `max_seqlen_in_batch_k` for the source sequence i.e. key/value).
-    """
-    indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
-    batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
-
-    key_layer = index_first_axis(key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k)
-    value_layer = index_first_axis(
-        value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-    )
-    if query_length == kv_seq_len:
-        query_layer = index_first_axis(query_layer.reshape(batch_size * kv_seq_len, -1, head_dim), indices_k)
-        cu_seqlens_q = cu_seqlens_k
-        max_seqlen_in_batch_q = max_seqlen_in_batch_k
-        indices_q = indices_k
-    elif query_length == 1:
-        max_seqlen_in_batch_q = 1
-        cu_seqlens_q = torch.arange(
-            batch_size + 1, dtype=torch.int32, device=query_layer.device
-        )  # There is a memcpy here, that is very bad.
-        indices_q = cu_seqlens_q[:-1]
-        query_layer = query_layer.squeeze(1)
-    else:
-        # The -q_len: slice assumes left padding.
-        attention_mask = attention_mask[:, -query_length:]
-        query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, *_ = unpad_input(query_layer, attention_mask)
-
-    return (
-        query_layer,
-        key_layer,
-        value_layer,
-        indices_q,
-        (cu_seqlens_q, cu_seqlens_k),
-        (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
-    )
-
-def _flash_attention_forward(
-    self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
-):
-    """
-    Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
-    first unpad the input, then computes the attention scores and pad the final attention scores.
-
-    Args:
-        query_states (`torch.Tensor`):
-            Input query states to be passed to Flash Attention API
-        key_states (`torch.Tensor`):
-            Input key states to be passed to Flash Attention API
-        value_states (`torch.Tensor`):
-            Input value states to be passed to Flash Attention API
-        attention_mask (`torch.Tensor`):
-            The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
-            position of padding tokens and 1 for the position of non-padding tokens.
-        dropout (`float`):
-            Attention dropout
-        softmax_scale (`float`, *optional*):
-            The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
-    """
-    if not self._flash_attn_uses_top_left_mask:
-        causal = self.is_causal
-    else:
-        # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LlamaFlashAttention2 __init__.
-        causal = self.is_causal and query_length != 1
-
-    # Contains at least one padding token in the sequence
-    if attention_mask is not None:
-        batch_size = query_states.shape[0]
-        query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-            query_states, key_states, value_states, attention_mask, query_length
-        )
-
-        cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-        max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
-        attn_output_unpad = flash_attn_varlen_func(
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_in_batch_q,
-            max_seqlen_k=max_seqlen_in_batch_k,
-            dropout_p=dropout,
-            softmax_scale=softmax_scale,
-            causal=causal,
-        )
-
-        attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
-    else:
-        attn_output = flash_attn_func(
-            query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
-        )
-
-    # if self.layer_idx == 0:
-    #     import pdb; pdb.set_trace()
-
-    return attn_output
 
 
 def llama_attn_forward_PyramidKV(
@@ -2238,45 +2079,49 @@ def llama_flash_attn2_forward_SnapKV(
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    # [SnapKV] register kv_cluster
+    # [SnapKV] 初始化 KV Cluster
     init_snapkv(self)
-    # LlamaFlashAttention2 attention does not support output_attentions
+
     if "padding_mask" in kwargs:
         warnings.warn(
-            "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            "Passing `padding_mask` is deprecated and will be removed in v4.37. Please use `attention_mask` instead."
         )
-
-        # overwrite attention_mask with padding_mask
         attention_mask = kwargs.pop("padding_mask")
 
     output_attentions = False
-
     bsz, q_len, _ = hidden_states.size()
 
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
 
-    # Flash attention requires the input to have the shape
-    # batch_size x seq_length x head_dim x hidden_dim
-    # therefore we just need to keep the original shape
+    # 形状转换: (bsz, num_heads, q_len, head_dim)
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    
+
+    # 计算 position embeddings（RoPE）
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
+
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    # [SnapKV] 记录当前 kv 长度
     kv_seq_len = key_states.shape[-2]
-    # if past_key_value is not None:
-    #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
     if past_key_value is not None:
         if self.layer_idx is None:
             raise ValueError(
-                f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                "with a layer index."
+                f"The cache structure has changed since version v4.36. "
+                f"If you are using {self.__class__.__name__} for auto-regressive decoding, "
+                f"please initialize the attention class with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): #[SnapKV] add kv_seq_len
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -2284,64 +2129,72 @@ def llama_flash_attn2_forward_SnapKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    cos, sin = self.rotary_emb(value_states, position_ids)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-    # [SnapKV] move to ahead
+    # 重复 KV（如果 num_key_value_groups < num_heads）
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+    # SnapKV 更新缓存逻辑
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-        # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        # print('kv_seq_len:', kv_seq_len)
-        # print('key_states.shape:', key_states.shape)
-        if key_states.shape[-2] == kv_seq_len: # [SnapKV] add kv_cluster
-            self.kv_seq_len = kv_seq_len # [SnapKV] register kv_seq_len
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        if key_states.shape[-2] == kv_seq_len:
+            self.kv_seq_len = kv_seq_len
+            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                key_states, query_states, value_states, attention_mask, self.num_key_value_groups
+            )
             past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
         else:
             self.kv_seq_len += q_len
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        past_key_value._seen_tokens=self.kv_seq_len
-    # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-    # to be able to avoid many of these transpose/reshape/view.
+        past_key_value._seen_tokens = self.kv_seq_len
+
+    # 转置以适配 Flash Attention 的格式 (bsz, seq_len, num_heads, head_dim)
     query_states = query_states.transpose(1, 2)
     key_states = key_states.transpose(1, 2)
     value_states = value_states.transpose(1, 2)
 
+    # Dropout 设定
     dropout_rate = self.attention_dropout if self.training else 0.0
 
-    # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-    # therefore the input hidden states gets silently casted in float32. Hence, we need
-    # cast them back in the correct dtype just to be sure everything works as expected.
-    # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-    # in fp32. (LlamaRMSNorm handles it correctly)
-
+    # 强制还原原始精度（以防 LayerNorm cast 到 float32）
     input_dtype = query_states.dtype
     if input_dtype == torch.float32:
         if torch.is_autocast_enabled():
             target_dtype = torch.get_autocast_gpu_dtype()
-        # Handle the case where the model is quantized
         elif hasattr(self.config, "_pre_quantization_dtype"):
             target_dtype = self.config._pre_quantization_dtype
         else:
             target_dtype = self.q_proj.weight.dtype
 
         logger.warning_once(
-            f"The input hidden states seems to be silently casted in float32, this might be related to"
-            f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-            f" {target_dtype}."
+            f"The input hidden states were silently cast to float32. "
+            f"We will cast them back to {target_dtype} for consistency."
         )
 
         query_states = query_states.to(target_dtype)
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
 
+    if attention_mask.shape[1] != key_states.shape[1]:
+        attention_mask = torch.ones(
+            (attention_mask.shape[0], key_states.shape[1]),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
     attn_output = _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        q_len,
+        position_ids=position_ids,
+        dropout=dropout_rate,
+        sliding_window=getattr(self, "sliding_window", None),
+        use_top_left_mask=self._flash_attn_uses_top_left_mask,
+        is_causal=self.is_causal,
+        **kwargs,
     )
 
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
     attn_output = self.o_proj(attn_output)
 
     if not output_attentions:
