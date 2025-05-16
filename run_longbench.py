@@ -21,7 +21,8 @@ datasets = [
     # "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
     #         "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
     #         "passage_count", "passage_retrieval_en", "lcc", "repobench-p"
-    "trec", "triviaqa", "hotpotqa", "qasper",
+    # "trec", "triviaqa",
+    "hotpotqa", "qasper",
     "multi_news", "samsum",
      # "gov_report",
 ]
@@ -86,6 +87,7 @@ model2prompt = {
 # }
 
 model2maxlen = {
+    "llama": 7950,
     "llama2": 3950,
     "llama-2": 3950,
     "llama3": 7950,
@@ -281,9 +283,10 @@ def main(args):
                 max_new_tokens=output_max_len,
                 num_beams=1,
                 do_sample=False,
-                temperature=1.0,
+                temperature=0.6,
                 min_length=context_length+1,
-                eos_token_id=[tokenizer.eos_token_id]
+                eos_token_id=[tokenizer.eos_token_id],
+                top_p=0.95
             )
         else:
             print("Using quantization on kv cache")
@@ -302,11 +305,12 @@ def main(args):
                 max_new_tokens=output_max_len,
                 num_beams=1,
                 do_sample=False,
-                temperature=1.0,
+                temperature=0.6,
                 min_length=context_length+1,
                 eos_token_id=[tokenizer.eos_token_id],
                 cache_implementation="quantized", 
-                cache_config=quant_cache_config
+                cache_config=quant_cache_config,
+                top_p=0.95
             )
         batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
         # print(f"debbug batch_outputs {batch_outputs}")
@@ -350,7 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_num_examples", type=int, default=None, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--sample_method", type=str, default="topk", choices=["random", "topk"], help="how to sample the examples.")
     
-    parser.add_argument("--max_new_tokens", type=int, default=None, help="")
+    parser.add_argument("--max_new_tokens", type=int, default=32768, help="")
     
     parser.add_argument("--eval_batch_size", type=int, default=1, help="batch size for evaluation.")
     
