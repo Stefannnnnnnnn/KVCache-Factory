@@ -1,11 +1,12 @@
 export CUDA_VISIBLE_DEVICES=0
 export HF_HOME="/workspace"
 
-method=PyramidKV # Support PyramidKV, SnapKV, H2O, StreamingLLM, CAM, L2Norm, ThinK
+method=FullKV # Support PyramidKV, SnapKV, H2O, StreamingLLM, CAM, L2Norm, ThinK
 max_capacity_prompts=128 # 128,2048 in paper
 attn_implementation=flash_attention_2 # Support "flash_attention_2", "sdpa", "eager".
 source_path=~/outputs
 model_path=hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4
+# Annieee215/Deepseek-R-Distilled-Llama-70B-awq-shortGPT10
 merge_method=$7 # Support "pivot"(LOOK-M_PivotMerge).
 quant_method=kivi # Support kivi and kvquant, default None.
 nbits=4 # Quantization bit-width support 8,4,2. Need to set quant_method first.
@@ -19,7 +20,7 @@ python3 run_longbench.py \
     --max_capacity_prompts ${max_capacity_prompts} \
     --attn_implementation ${attn_implementation} \
     --save_dir ${save_dir} \
-    --max_num_examples 100
+    --max_num_examples 200
     # --nbits ${nbits} \
     # --quant_method ${quant_method}
         # --merge ${merge_method} \

@@ -266,6 +266,8 @@ def llama_flash_attn2_forward_PyramidKV(
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     
@@ -293,7 +295,7 @@ def llama_flash_attn2_forward_PyramidKV(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    
+
     kv_seq_len = key_states.shape[-2]
     # if past_key_value is not None:
     #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -312,13 +314,16 @@ def llama_flash_attn2_forward_PyramidKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    cos, sin = self.rotary_emb(value_states, position_ids)
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position} # Specific to RoPE models
         # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         # print('kv_seq_len:', kv_seq_len)
         # print('key_states.shape:', key_states.shape)
@@ -379,7 +384,17 @@ def llama_flash_attn2_forward_PyramidKV(
         value_states = value_states.to(target_dtype)
 
     attn_output = _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        q_len,
+        position_ids=position_ids,
+        dropout=dropout_rate,
+        sliding_window=getattr(self, "sliding_window", None),
+        use_top_left_mask=self._flash_attn_uses_top_left_mask,
+        is_causal=self.is_causal,
+        **kwargs,
     )
 
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -2083,7 +2098,6 @@ def llama_flash_attn2_forward_SnapKV(
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    # [SnapKV] 初始化 KV Cluster
     init_snapkv(self)
 
     if "padding_mask" in kwargs:
@@ -2099,12 +2113,10 @@ def llama_flash_attn2_forward_SnapKV(
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
 
-    # 形状转换: (bsz, num_heads, q_len, head_dim)
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-    # 计算 position embeddings（RoPE）
     if position_embeddings is None:
         cos, sin = self.rotary_emb(value_states, position_ids)
     else:
@@ -2112,7 +2124,6 @@ def llama_flash_attn2_forward_SnapKV(
 
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-    # [SnapKV] 记录当前 kv 长度
     kv_seq_len = key_states.shape[-2]
     if past_key_value is not None:
         if self.layer_idx is None:
@@ -2129,11 +2140,9 @@ def llama_flash_attn2_forward_SnapKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # 重复 KV（如果 num_key_value_groups < num_heads）
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-    # SnapKV 更新缓存逻辑
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         if key_states.shape[-2] == kv_seq_len:
@@ -2147,15 +2156,12 @@ def llama_flash_attn2_forward_SnapKV(
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         past_key_value._seen_tokens = self.kv_seq_len
 
-    # 转置以适配 Flash Attention 的格式 (bsz, seq_len, num_heads, head_dim)
     query_states = query_states.transpose(1, 2)
     key_states = key_states.transpose(1, 2)
     value_states = value_states.transpose(1, 2)
 
-    # Dropout 设定
     dropout_rate = self.attention_dropout if self.training else 0.0
 
-    # 强制还原原始精度（以防 LayerNorm cast 到 float32）
     input_dtype = query_states.dtype
     if input_dtype == torch.float32:
         if torch.is_autocast_enabled():
@@ -2174,7 +2180,7 @@ def llama_flash_attn2_forward_SnapKV(
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
 
-    if attention_mask.shape[1] != key_states.shape[1]:
+    if attention_mask is not None and attention_mask.shape[1] != key_states.shape[1]:
         attention_mask = torch.ones(
             (attention_mask.shape[0], key_states.shape[1]),
             dtype=attention_mask.dtype,
