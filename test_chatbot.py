@@ -21,7 +21,7 @@ DATASET2MAXLEN = {
 }
 
 # Placeholder for model path - user should change this to a valid Hugging Face model
-DEFAULT_MODEL_PATH = "gpt2" # A small model for quick testing, e.g., gpt2, gpt2-medium
+DEFAULT_MODEL_PATH = "Annieee215/Deepseek-R-Distilled-Llama-70B-awq-shortGPT10"
 # For actual benchmarking, you'd use models like "meta-llama/Llama-2-7b-chat-hf", etc.
 
 # --- Helper Functions ---
@@ -31,8 +31,25 @@ def load_model_and_tokenizer(model_path):
     """Loads the model and tokenizer, and caches them."""
     st.info(f"Attempting to load model: {model_path}...")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        model = AutoModelForCausalLM.from_pretrained(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            use_fast=True,
+            padding_side="left",
+            cache_dir="/workspace"
+        )
+        from pyramidkv.monkeypatch import replace_llama
+        # ,replace_mistral
+        replace_llama("PyramidKV".lower())
+        # replace_mistral(args.method.lower())
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+            use_cache=True,
+            attn_implementation="flash_attention_2",
+            cache_dir="/workspace"
+        )   
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id # Ensure pad_token_id is also set
@@ -52,7 +69,7 @@ def load_dataset(dataset_name):
     Loads a dataset from a JSONL file.
     Assumes files are in a './data/' directory (e.g., './data/narrativeqa.jsonl').
     """
-    file_path = f"./data/{dataset_name}.jsonl"
+    file_path = f"data/LongBench/{dataset_name}.jsonl"
     data = []
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -151,25 +168,45 @@ with col1:
 
             with st.spinner(f"Processing with '{selected_model_path}' on {device}... This may take a moment."):
                 try:
-                    inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=tokenizer.model_max_length - DATASET2MAXLEN.get(selected_dataset_name, 100) - 10, padding=True) # Ensure space for generation + buffer
-                    inputs = inputs.to(device)
-                    input_ids = inputs.input_ids
-                    attention_mask = inputs.attention_mask # Get attention mask
-                    actual_input_token_count = input_ids.shape[1]
-
+                    tokenized_prompts = tokenizer(full_prompt, padding="longest", return_tensors="pt", add_special_tokens=True).to('cuda')
+                    actual_input_token_count = tokenized_prompts.input_ids.shape[0]
                     max_new_tokens = DATASET2MAXLEN.get(selected_dataset_name, 100) # Get max new tokens based on dataset
+
+                    kernel_sizes = 7
+                    pooling = "maxpool"
+                    ratio = 0.4
+                    window_sizes = 8
+                    recent_size = 32
+                    max_capacity_prompts = 1024
+                    layers = len(model.model.layers)
+                    # check if window_sizes is a list
+                    if not isinstance(window_sizes, list):
+                        window_sizes = [window_sizes] * layers
+                    if not isinstance(max_capacity_prompts, list):
+                        max_capacity_prompts = [max_capacity_prompts] * layers
+                    if not isinstance(kernel_sizes, list):
+                        kernel_sizes = [kernel_sizes] * layers
+                    if not isinstance(ratio, list):
+                        ratio = [ratio] * layers
+                    if not isinstance(recent_size, list):
+                        recent_size = [recent_size] * layers
+                    for i in range(layers):
+                        model.model.layers[i].self_attn.config.window_size = window_sizes[i]
+                        model.model.layers[i].self_attn.config.max_capacity_prompt = max_capacity_prompts[i]
+                        model.model.layers[i].self_attn.config.kernel_size = kernel_sizes[i]
+                        model.model.layers[i].self_attn.config.pooling = pooling
+                        model.model.layers[i].self_attn.config.ratio = ratio[i]
+                        model.model.layers[i].self_attn.config.recent_size = recent_size[i]
 
                     time_start_generate = time.perf_counter()
                     # Generate response using the model
                     generated_outputs = model.generate(
-                        input_ids,
-                        attention_mask=attention_mask, # Pass attention_mask
+                        **tokenized_prompts,
+                        num_beams=1,
+                        do_sample=False,
                         max_new_tokens=max_new_tokens,
                         pad_token_id=tokenizer.pad_token_id,
                         eos_token_id=tokenizer.eos_token_id,
-                        # For more deterministic output, consider:
-                        # num_beams=1,
-                        # do_sample=False,
                     )
                     time_end_generate = time.perf_counter()
 
