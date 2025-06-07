@@ -1,16 +1,24 @@
 ![# KVCache-Facroty](assets/logo.png)
 
-## Enviroment Notes
+## 🛠️ Project Notes (Fork Notice)
 
-**When installing flash-attn, download the wheel**
+This repository is based on a fork of the original work:  
+**[KVCache-Factory by Zefan-Cai](https://github.com/Zefan-Cai/KVCache-Factory)**
 
- https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/flash_attn-2.7.3+cu11torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl, 
- 
- **and install it with pip locally.**
+Modifications were made to adapt the codebase to our use case, including:
+- Integrating a custom demo interface (`demo_chatbot.py`)
+- New scripts for throughput/memory benchmarking
+- Adjustments to environment setup (`init.sh`)
 
- If this wheel still does not work, try to **build flash-attn from the source**
+Refer to the following for usage:
+- Setup: `~/init.sh`
+- Throughput/Memory Benchmark: `~/benchmark_throughput.sh`
+- LongBench Evaluation: `~/scripts/scripts_longBench/eval.sh`
+- Demo Chatbot: `~/demo_chatbot.py`
 
-- Currently, we use init.sh to initialize the environment.
+---
+
+⬇️ **Below is the original README from the upstream repository**
 
 ## News
 

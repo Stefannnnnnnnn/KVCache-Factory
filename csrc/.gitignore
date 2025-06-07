@@ -2,3 +2,4 @@ build/
 deps/
 tiny_pkg.egg-info/
 test.py
+server2git.txt
